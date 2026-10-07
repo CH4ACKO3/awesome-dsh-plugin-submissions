@@ -97,12 +97,15 @@ jobs:
     steps:
       # Probes may exhaust the installation's hourly REST budget. Waiting here
       # preserves a successful build and lets deployment retry without probing.
-      - name: Wait for deployment API budget
+      - name: Check deployment readiness
+        id: readiness
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs'
           import { setTimeout } from 'node:timers/promises'
           const deadline = Date.now() + 65 * 60 * 1000
           for (;;) {
@@ -119,8 +122,21 @@ jobs:
             console.log(`Waiting ${Math.ceil(delay / 1000)} seconds for deployment API budget`)
             await setTimeout(delay)
           }
+          const site = await fetch(`${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/pages`, {
+            headers: { authorization: `Bearer ${process.env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json', 'user-agent': 'awesome-dsh-pages-deploy' },
+            signal: AbortSignal.timeout(30000),
+          })
+          if (!site.ok && site.status !== 404) throw new Error(`Pages configuration check failed: HTTP ${site.status}`)
+          const enabled = site.ok && (await site.json()).build_type === 'workflow'
+          appendFileSync(process.env.GITHUB_OUTPUT, `enabled=${enabled}\n`)
+          if (!enabled) {
+            const message = 'Pages deployment skipped: this repository has no Pages site configured for GitHub Actions. The built site remains available as a workflow artifact.'
+            console.log(`::notice::${message}`)
+            appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${message}\n`)
+          }
           NODE
       - id: deployment
+        if: steps.readiness.outputs.enabled == 'true'
         uses: actions/deploy-pages@v4
         with:
           artifact_name: ${{ needs.build.outputs.artifact_name }}
